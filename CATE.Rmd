@@ -1,0 +1,122 @@
+```{r}
+install.packages("caret")
+library(data.table)
+library(tidyverse)
+library(parallel)
+library(caret)
+library(ranger)
+library(mvtnorm)
+library(grf)
+
+
+```
+
+
+```{r}
+num_simulations <- 1000
+
+# a list to store results
+results_high_corr <- vector("list", length = num_simulations)
+
+# Loop over simulations
+for (i in 1:num_simulations) {
+  # Generate data
+  N <- 1000
+  correlation <- 0.8  
+  mean_values <- c(0.5, 0)  
+  cov_matrix <- matrix(c(1, correlation, correlation, 1), nrow = 2)  
+  correlated_values <- rmvnorm(N, mean = mean_values, sigma = cov_matrix)
+  data <- data.table(
+    x = correlated_values[, 2],
+    T = correlated_values[, 1],
+    mu = rnorm(N)
+  ) %>% 
+    .[, Y := 2 + x + T + mu] %>%  
+    .[, id := 1:.N]
+  
+  # data$interaction <- data$x*data$T  
+  
+  # CF
+  
+  cf_trained <- grf::causal_forest(
+    X = data[, .(x)] %>% as.matrix(),
+    Y = data[, Y],
+    W = data[, T]
+  )
+  variables <- c("x")
+  
+  pred_data <- seq(-1, 1, length.out = 1000)
+  pred_data <- data.table(x = pred_data)
+  
+# data$x <- pred_data
+  pred_cf <- predict(cf_trained, newdata =   pred_data[, ..variables], estimate.variance=TRUE)
+  data$tau_CF <- pred_cf$predictions
+   
+  
+  # RF
+  #data$interaction <- data$x*data$T 
+  pre_treated <- data
+  pre_control <- data
+  
+  pre_control$T <- 0
+  pre_treated$T <- 1
+  
+  
+  rf_fit <- ranger(Y ~ x + T , data = data)
+  
+  pre_control$x <- pred_data
+  pre_treated$x <- pred_data 
+  
+  pre_treated$pred_y_treated <- predict(rf_fit, data = pre_treated)$predictions
+  
+  
+  pre_control$pred_y_control <- predict(rf_fit, data = pre_control)$predictions
+  
+  data$tau_RF <- pre_treated$pred_y_treated - pre_control$pred_y_control
+  #ACATE_RF <- mean(data$tau_RF)
+  
+  data$true_treatment_effect <- 1
+  data$Bias_CF <- data$true_treatment_effect - data$tau_CF
+  data$Bias_RF <- data$true_treatment_effect - data$tau_RF
+  
+  
+  # results
+  results_high_corr[[i]] <- list(data = data)
+}
+
+```
+
+# Combine results and calculate bias
+
+```{r}
+all_results <- rbindlist(lapply(results_high_corr, `[[`, "data"))
+
+average_bias <- all_results %>%
+  group_by(id) %>%
+  summarize(Avg_Bias_CF = mean(Bias_CF),
+            Avg_Bias_RF = mean(Bias_RF))
+
+average_bias$x_seq <- pred_data
+
+average_bias <- data.table(average_bias)
+results_melted_new <- melt(average_bias, id.vars = c("id", "x_seq"), variable.name = "Method", value.name = "CATE")
+
+```
+
+# Visualize the results
+
+```{r}
+# Plot with smoothed lines
+ggplot(results_melted_new , aes(x = x_seq, y = CATE, group = Method, color = Method)) +
+  geom_smooth(method = "loess") +
+  labs(
+    title = "Conditional Treatment Effects (CATE)",
+    x = "x",
+    y = "CATE",
+    color = "Method"
+  ) +
+  facet_wrap(~ Method, scales = "fixed") +
+  theme_minimal()
+
+
+```
